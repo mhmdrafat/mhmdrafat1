@@ -5,10 +5,9 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
-
-import requests
-from bs4 import BeautifulSoup
+from typing import List, Optional, Set
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 
 ARCHIVE_BASE = "https://web.archive.org/web/"
@@ -26,169 +25,161 @@ class ClinicRecord:
     services: str
 
 
-def http_get(url: str, timeout: int = 30) -> requests.Response:
+def http_get_html(url: str, timeout: int = 30) -> str:
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
     }
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            charset_match = re.search(r"charset=([\w-]+)", content_type, flags=re.I)
+            charset = charset_match.group(1) if charset_match else "utf-8"
+            return resp.read().decode(charset, errors="replace")
+    except (HTTPError, URLError) as e:
+        raise RuntimeError(f"HTTP error for {url}: {e}")
 
 
 def find_region_urls() -> List[str]:
-    resp = http_get(OUR_CLINICS_URL)
-    soup = BeautifulSoup(resp.text, "lxml")
+    html = http_get_html(OUR_CLINICS_URL)
     region_urls: Set[str] = set()
-    for a in soup.find_all("a", href=True):
-        href: str = a["href"]
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I):
         if "/our-clinics/regions/" in href:
-            # Wayback URLs might miss the timestamp for some anchors; ensure absolute archive URL
             if href.startswith("http"):
                 region_urls.add(href)
+            elif href.startswith("/web/"):
+                region_urls.add("https://web.archive.org" + href)
             else:
+                # Fallback: assume original site path
                 region_urls.add(ARCHIVE_BASE + href.lstrip("/"))
-
-    # Also include Sunshine Coast page ID variant if present (menu-item is a page)
-    # Already captured by the anchor scan above; no special-case needed.
     return sorted(region_urls)
 
 
 def find_clinic_urls(region_url: str) -> List[str]:
-    resp = http_get(region_url)
-    soup = BeautifulSoup(resp.text, "lxml")
+    html = http_get_html(region_url)
     clinic_urls: Set[str] = set()
 
-    # Primary: links inside the regional clinics grid
-    for a in soup.select(".regional-clinics a[href]"):
-        href: str = a.get("href", "")
-        if "/our-clinics/" in href:
+    # Look for anchors within the regional clinics table rows first
+    # Heuristic: capture all our-clinics page links on region page
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I):
+        if "/our-clinics/" in href and not href.rstrip("/").endswith("/our-clinics"):
             if href.startswith("http"):
                 clinic_urls.add(href)
+            elif href.startswith("/web/"):
+                clinic_urls.add("https://web.archive.org" + href)
             else:
                 clinic_urls.add(ARCHIVE_BASE + href.lstrip("/"))
-
-    # Fallback: any anchor pointing to a clinic page under /our-clinics/
-    if not clinic_urls:
-        for a in soup.find_all("a", href=True):
-            href: str = a["href"]
-            if "/our-clinics/" in href and not href.rstrip("/").endswith("/our-clinics"):
-                if href.startswith("http"):
-                    clinic_urls.add(href)
-                else:
-                    clinic_urls.add(ARCHIVE_BASE + href.lstrip("/"))
 
     return sorted(clinic_urls)
 
 
-def extract_text(elem) -> str:
-    if not elem:
-        return ""
-    return " ".join(elem.get_text(" ", strip=True).split())
+def strip_tags(text: str) -> str:
+    # Remove HTML tags and condense whitespace
+    text = re.sub(r"<\s*br\s*/?>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
 
 
-def parse_json_ld(soup: BeautifulSoup) -> Optional[dict]:
-    # Collect all JSON-LD blocks and find the LocalBusiness object
-    for script in soup.find_all("script", type=lambda t: t and "ld+json" in t):
+def parse_json_ld(html: str) -> Optional[dict]:
+    # Find all <script type="application/ld+json"> blocks and parse JSON
+    json_ld_blocks = re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        flags=re.I | re.S,
+    )
+    fallback: Optional[dict] = None
+    for block in json_ld_blocks:
+        content = block.strip()
         try:
-            data = json.loads(script.string or script.text or "{}")
+            data = json.loads(content)
         except json.JSONDecodeError:
-            # Some pages have multiple JSON objects concatenated or HTML comments; try to sanitize
+            # Try to fix common issues: stray comments or multiple objects
+            content_clean = re.sub(r"/\*.*?\*/", "", content, flags=re.S)
             try:
-                cleaned = (script.string or script.text or "").strip()
-                # Attempt to load array-wrapped JSON-LD
-                if cleaned.startswith("[") and cleaned.endswith("]"):
-                    data = json.loads(cleaned)
-                else:
-                    continue
-            except Exception:
+                data = json.loads(content_clean)
+            except json.JSONDecodeError:
                 continue
 
-        # JSON-LD may be a dict or a list
-        candidates: List[dict] = []
+        objs: List[dict] = []
         if isinstance(data, dict):
-            candidates = [data]
+            objs = [data]
         elif isinstance(data, list):
-            candidates = [x for x in data if isinstance(x, dict)]
+            objs = [x for x in data if isinstance(x, dict)]
 
-        for obj in candidates:
+        for obj in objs:
             obj_type = obj.get("@type")
             if not obj_type:
                 continue
-            # @type may be a string or a list
             types = {obj_type} if isinstance(obj_type, str) else set(obj_type)
-            if any(t in ("LocalBusiness", "Organization") for t in types):
-                # Prefer LocalBusiness over Organization if both present
-                if "LocalBusiness" in types:
-                    return obj
-                # else keep as fallback
-                lb = obj.copy()
-                # do not return immediately; there may be a LocalBusiness ahead
-                # store as fallback
-                return lb
-    return None
+            if "LocalBusiness" in types:
+                return obj
+            if any(t in ("Organization",) for t in types):
+                fallback = fallback or obj
+    return fallback
 
 
 def normalize_phone(phone: str) -> str:
     if not phone:
         return ""
-    # Remove spaces inside parentheses, keep formatting mostly
     return re.sub(r"\s+", " ", phone).strip()
 
 
 def normalize_services(services: List[str]) -> str:
-    # Deduplicate preserving order, title-case consistently but keep acronyms
-    seen = set()
+    seen_lower: Set[str] = set()
     ordered: List[str] = []
     for s in services:
         s_clean = re.sub(r"\s+", " ", s).strip()
         if not s_clean:
             continue
         key = s_clean.lower()
-        if key not in seen:
-            seen.add(key)
+        if key not in seen_lower:
+            seen_lower.add(key)
             ordered.append(s_clean)
     return ", ".join(ordered)
 
 
-def extract_services(soup: BeautifulSoup) -> List[str]:
+def extract_services(html: str, ld: Optional[dict]) -> List[str]:
     services: List[str] = []
-    # Common section: list items linking to /our-services/
-    for a in soup.select('a[href*="/our-services/"]'):
-        text = extract_text(a)
+    # From anchors text
+    for m in re.finditer(r'<a[^>]+href=["\'][^"\']*/our-services/[^"\']*["\'][^>]*>(.*?)</a>', html, flags=re.I | re.S):
+        text = strip_tags(m.group(1))
         if text:
             services.append(text)
 
-    # Fallback: JSON-LD makesOffer urls -> derive name from path segment
-    ld = parse_json_ld(soup)
+    # From JSON-LD makesOffer
     if ld and isinstance(ld.get("makesOffer"), list):
         for offer in ld["makesOffer"]:
-            url = offer.get("url") if isinstance(offer, dict) else None
-            if not url:
-                continue
-            # derive last path segment as name
-            m = re.search(r"/our-services/([^/?#]+)/?", url)
-            if m:
-                slug = m.group(1)
-                slug = slug.replace("-", " ").strip()
-                if slug:
-                    services.append(slug.title())
-
+            if isinstance(offer, dict):
+                url = offer.get("url")
+                if not url:
+                    continue
+                m = re.search(r"/our-services/([^/?#]+)/?", url)
+                if m:
+                    slug = m.group(1).replace("-", " ").strip()
+                    if slug:
+                        services.append(slug.title())
     return services
 
 
 def extract_clinic_fields(clinic_url: str) -> Optional[ClinicRecord]:
     try:
-        resp = http_get(clinic_url)
+        html = http_get_html(clinic_url)
     except Exception as e:
         sys.stderr.write(f"Failed to fetch clinic page: {clinic_url} -> {e}\n")
         return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    ld = parse_json_ld(html) or {}
 
-    # JSON-LD primary source
-    ld = parse_json_ld(soup) or {}
-
-    name = ld.get("name") or extract_text(soup.find("h1"))
+    # Name
+    name = ld.get("name") or ""
+    if not name:
+        # Fallback: try to read <h1>...</h1>
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.I | re.S)
+        if m:
+            name = strip_tags(m.group(1))
 
     # Address
     address_text = ""
@@ -201,35 +192,26 @@ def extract_clinic_fields(clinic_url: str) -> Optional[ClinicRecord]:
             addr.get("postalCode") or "",
         ]
         address_text = ", ".join([p for p in parts if p]).strip(", ")
-    if not address_text:
-        # Fallback: look for address blocks
-        # Sometimes in a map/address container, but JSON-LD is usually present.
-        address_candidate = soup.select_one(".clinic-address, .address, address")
-        address_text = extract_text(address_candidate)
 
     # Phone
     phone = ld.get("telephone") or ""
     if not phone:
-        tel_anchor = None
-        for a in soup.select('a[href^="tel:"]'):
-            tel = a.get("href", "")[4:]
-            if tel and re.sub(r"\D", "", tel) != "1800366837":
-                tel_anchor = a
-                break
-        if tel_anchor:
-            phone = extract_text(tel_anchor)
+        m_tel = re.search(r'href=["\']tel:([^"\']+)["\']', html, flags=re.I)
+        if m_tel:
+            tel_val = m_tel.group(1)
+            if re.sub(r"\D", "", tel_val) != "1800366837":
+                phone = tel_val
     phone = normalize_phone(phone)
 
     # Email
     email = ld.get("email") or ""
     if not email:
-        mail = soup.select_one('a[href^="mailto:"]')
-        if mail:
-            href = mail.get("href", "")
-            email = href.split(":", 1)[-1]
+        m_mail = re.search(r'href=["\']mailto:([^"\']+)["\']', html, flags=re.I)
+        if m_mail:
+            email = m_mail.group(1)
 
     # Services
-    services_list = extract_services(soup)
+    services_list = extract_services(html, ld)
     services = normalize_services(services_list)
 
     return ClinicRecord(
